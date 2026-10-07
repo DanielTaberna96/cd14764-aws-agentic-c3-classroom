@@ -233,8 +233,31 @@ def _make_send_device_command_tool():
 
 def build_device_monitor() -> Agent:
     """Build the Device Monitor agent with a read_sensor_data tool."""
-    # --- YOUR CODE HERE ---
-    pass
+
+    model = BedrockModel(
+        model_id=MODEL_ID,
+        region_name=AWS_REGION,
+        temperature=0.0,
+        max_tokens=3000,
+        additional_request_fields={
+            "inferenceConfig": {
+                "topK": 1
+            }
+        },
+    )
+
+    read_sensor_data = _make_read_sensor_data_tool()
+
+    system_prompt = """You are a Device Monitor agent. Your ONLY job is reading sensor data.
+Call the read_sensor_data tool with the device_id.
+After the tool returns, output ONLY the raw JSON result.
+Do not diagnose issues or send commands."""
+
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[read_sensor_data],
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -245,8 +268,31 @@ def build_device_monitor() -> Agent:
 
 def build_diagnostics_agent() -> Agent:
     """Build the Diagnostics agent with a diagnose_issue tool."""
-    # --- YOUR CODE HERE ---
-    pass
+
+    model = BedrockModel(
+        model_id=MODEL_ID,
+        region_name=AWS_REGION,
+        temperature=0.0,
+        max_tokens=3000,
+        additional_request_fields={
+            "inferenceConfig": {
+                "topK": 1
+            }
+        },
+    )
+
+    diagnose_issue = _make_diagnose_issue_tool()
+
+    system_prompt = """You are a Diagnostics agent. Your ONLY job is diagnosing device issues.
+You will receive sensor data JSON. Call the diagnose_issue tool with that JSON.
+After the tool returns, output ONLY the raw JSON result.
+Do not read sensors or send commands."""
+
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[diagnose_issue],
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -256,8 +302,32 @@ def build_diagnostics_agent() -> Agent:
 
 def build_command_agent() -> Agent:
     """Build the Command agent with a send_device_command tool."""
-    # --- YOUR CODE HERE ---
-    pass
+
+    model = BedrockModel(
+        model_id=MODEL_ID,
+        region_name=AWS_REGION,
+        temperature=0.0,
+        max_tokens=3000,
+        additional_request_fields={
+            "inferenceConfig": {
+                "topK": 1
+            }
+        },
+    )
+
+    send_device_command = _make_send_device_command_tool()
+
+    system_prompt = """You are a Command agent. Your ONLY job is sending corrective device commands.
+You will receive a device_id and an issue_type.
+Call the send_device_command tool with those values.
+After the tool returns, output ONLY the raw JSON result.
+Do not read sensor data or diagnose issues."""
+
+    return Agent(
+        model=model,
+        system_prompt=system_prompt,
+        tools=[send_device_command],
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -278,8 +348,24 @@ def run_device_pipeline(device_id: str) -> dict:
     #   Hint: prompt should ask to read sensor data for the device_id
     print("    [1/3] Device Monitor...")
     # --- YOUR CODE HERE ---
-    sensor_json = {}
-    sensor_str = "{}"
+    monitor_result = run_agent_with_retry(
+        build_device_monitor,
+        f"Read sensor data for device_id={device_id}"
+    )
+
+    try:
+        sensor_json = json.loads(monitor_result)
+        sensor_str = json.dumps(sensor_json)
+    except (json.JSONDecodeError, TypeError):
+        json_match = re.search(r'\{[\s\S]*\}', str(monitor_result))
+        sensor_str = json_match.group(0) if json_match else str(monitor_result)
+
+        try:
+            sensor_json = json.loads(sensor_str)
+        except Exception:
+            sensor_json = {"raw": sensor_str}
+
+    print(f"          Device: {sensor_json.get('device_name', '?')}")
 
     # TODO 5: Call the Diagnostics Agent
     #   - Use run_agent_with_retry(build_diagnostics_agent, prompt)
@@ -288,8 +374,25 @@ def run_device_pipeline(device_id: str) -> dict:
     #   - Extract the list of issues
     print("    [2/3] Diagnostics Agent...")
     # --- YOUR CODE HERE ---
-    diag_json = {}
-    issues = []
+    diag_result = run_agent_with_retry(
+        build_diagnostics_agent,
+        f"Diagnose issues from this sensor data: {sensor_str}"
+    )
+
+    try:
+        diag_json = json.loads(diag_result)
+        diag_str = json.dumps(diag_json)
+    except (json.JSONDecodeError, TypeError):
+        json_match = re.search(r'\{[\s\S]*\}', str(diag_result))
+        diag_str = json_match.group(0) if json_match else str(diag_result)
+
+        try:
+            diag_json = json.loads(diag_str)
+        except Exception:
+            diag_json = {"raw": diag_str}
+
+    issues = diag_json.get("issues", [])
+    print(f"          Issues: {len(issues)} found")
 
     # TODO 6: Call the Command Agent for each issue
     #   - Loop through the issues list from TODO 5
@@ -301,7 +404,26 @@ def run_device_pipeline(device_id: str) -> dict:
         for issue in issues:
             issue_type = issue.get("issue", "unknown")
             print(f"    [3/3] Command Agent ({issue_type})...")
-            # --- YOUR CODE HERE ---
+            cmd_result = run_agent_with_retry(
+            build_command_agent,
+            f"Send command for device_id={device_id} with issue_type={issue_type}"
+        )
+
+        try:
+            cmd_json = json.loads(cmd_result)
+        except (json.JSONDecodeError, TypeError):
+            json_match = re.search(r'\{[\s\S]*\}', str(cmd_result))
+
+            if json_match:
+                try:
+                    cmd_json = json.loads(json_match.group(0))
+                except Exception:
+                    cmd_json = {"raw": str(cmd_result)}
+            else:
+                cmd_json = {"raw": str(cmd_result)}
+
+        commands.append(cmd_json)
+        print(f"          Action: {cmd_json.get('action', '?')}")
     else:
         print("    [3/3] Command Agent — skipped (device healthy)")
 
