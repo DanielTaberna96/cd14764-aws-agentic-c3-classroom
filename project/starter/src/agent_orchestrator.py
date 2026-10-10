@@ -959,42 +959,108 @@ def create_guardrail() -> tuple[str, str]:
 
     # Check if guardrail already exists to avoid duplicates
     existing = bedrock_client.list_guardrails()
+    existing_guardrail_id = None
+    existing_guardrail_version = ''
     for g in existing.get('guardrails', []):
         if g['name'] == config.GUARDRAIL_NAME:
-            guardrail_id = g['id']
-            versions = bedrock_client.list_guardrails(guardrailIdentifier=guardrail_id)
-            guardrail_version = 'DRAFT'
-            for v in versions.get('guardrails', []):
-                if v.get('version', 'DRAFT') != 'DRAFT':
-                    guardrail_version = v['version']
-            print(f"Guardrail already exists: {guardrail_id} (version: {guardrail_version})")
-            return guardrail_id, guardrail_version
+            existing_guardrail_id = g['id']
+            versions = bedrock_client.list_guardrails(
+                guardrailIdentifier=existing_guardrail_id
+            )
+            published_versions = [
+                str(version.get('version', ''))
+                for version in versions.get('guardrails', [])
+                if str(version.get('version', '')).isdigit()
+            ]
+            if published_versions:
+                existing_guardrail_version = max(published_versions, key=int)
+            break
 
-    # TODO: Create the guardrail
-    # Use bedrock_client.create_guardrail() with:
-    #   - name (config.GUARDRAIL_NAME) and description
-    #   - contentPolicyConfig - filtersConfig for SEXUAL, VIOLENCE, HATE at HIGH
-    #     strength and INSULTS, MISCONDUCT at MEDIUM strength (input + output)
-    #   - sensitiveInformationPolicyConfig - piiEntitiesConfig:
-    #       CREDIT_DEBIT_CARD_NUMBER and US_SOCIAL_SECURITY_NUMBER -> BLOCK
-    #       EMAIL and PHONE -> ANONYMIZE
-    #   - topicPolicyConfig - one DENY topic per entry in config.GUARDRAIL_BLOCKED_TOPICS
-    #     (competitor products, pricing negotiations, legal threats)
-    #     Use topicPolicyConfig.tierConfig = {'tierName': 'STANDARD'} and
-    #     top-level crossRegionConfig = {'guardrailProfileIdentifier': 'us.guardrail.v1:0'}.
-    #     Define pricing negotiations as haggling / changing an advertised price,
-    #     excluding arithmetic using an already-specified price and discount.
-    #     Classic-tier definitions tested in this project blocked the math scenario.
-    #     Validate allowed arithmetic (input and output) and blocked negotiation,
-    #     competitor and legal-threat requests. Keep all required safety policies.
-    #   - wordPolicyConfig - managedWordListsConfig with type PROFANITY
-    #   - blockedInputMessaging and blockedOutputsMessaging
-    #
-    # Then promote it from DRAFT to a numbered version with
-    # bedrock_client.create_guardrail_version(guardrailIdentifier=...)
-    # and return (guardrail_id, guardrail_version).
+    topic_definitions = {
+        'competitor products': (
+            'Competitor Products',
+            'Requests for recommendations, comparisons, or information about products sold by companies that compete with NovaMart.',
+        ),
+        'pricing negotiations': (
+            'Pricing Negotiations',
+            'Requests to haggle over, bargain for, or change a product’s advertised price, including requests to match another seller’s price. Do not classify arithmetic, totals, savings, or calculations using a price and discount already specified in the request as pricing negotiation.',
+        ),
+        'legal threats': (
+            'Legal Threats',
+            'Threats to sue NovaMart, pursue legal action, or use legal proceedings to compel an outcome.',
+        ),
+    }
+    topics = []
+    for configured_topic in config.GUARDRAIL_BLOCKED_TOPICS:
+        name, definition = topic_definitions.get(
+            configured_topic.lower(),
+            (configured_topic.title(), f"Requests about {configured_topic}."),
+        )
+        topics.append({'name': name, 'definition': definition, 'type': 'DENY'})
 
-    pass
+    def _create_numbered_version(guardrail_id: str) -> str:
+        version_response = bedrock_client.create_guardrail_version(
+            guardrailIdentifier=guardrail_id,
+            description='Published NovaMart guardrail version.',
+        )
+        version = str(version_response.get('version', ''))
+        if not version.isdigit():
+            raise RuntimeError(
+                f"Guardrail {guardrail_id} did not produce a numbered version: {version or 'missing'}"
+            )
+        return version
+
+    # Reuse a previously published version; publish the existing DRAFT if no
+    # numbered version is available yet.
+    if existing_guardrail_id:
+        guardrail_version = existing_guardrail_version or _create_numbered_version(
+            existing_guardrail_id
+        )
+        print(
+            f"Guardrail already exists: {existing_guardrail_id} "
+            f"(version: {guardrail_version})"
+        )
+        return existing_guardrail_id, guardrail_version
+
+    response = bedrock_client.create_guardrail(
+        name=config.GUARDRAIL_NAME,
+        description='Protect NovaMart customer support interactions from harmful content, sensitive information, and restricted topics.',
+        crossRegionConfig={'guardrailProfileIdentifier': 'us.guardrail.v1:0'},
+        contentPolicyConfig={
+            'filtersConfig': [
+                {'type': 'SEXUAL', 'inputStrength': 'HIGH', 'outputStrength': 'HIGH'},
+                {'type': 'VIOLENCE', 'inputStrength': 'HIGH', 'outputStrength': 'HIGH'},
+                {'type': 'HATE', 'inputStrength': 'HIGH', 'outputStrength': 'HIGH'},
+                {'type': 'INSULTS', 'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+                {'type': 'MISCONDUCT', 'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+            ],
+        },
+        sensitiveInformationPolicyConfig={
+            'piiEntitiesConfig': [
+                {'type': 'CREDIT_DEBIT_CARD_NUMBER', 'action': 'BLOCK'},
+                {'type': 'US_SOCIAL_SECURITY_NUMBER', 'action': 'BLOCK'},
+                {'type': 'EMAIL', 'action': 'ANONYMIZE'},
+                {'type': 'PHONE', 'action': 'ANONYMIZE'},
+            ],
+        },
+        topicPolicyConfig={
+            'topicsConfig': topics,
+            'tierConfig': {'tierName': 'STANDARD'},
+        },
+        wordPolicyConfig={
+            'managedWordListsConfig': [{'type': 'PROFANITY'}],
+        },
+        blockedInputMessaging=(
+            'I’m sorry, but I can’t help with that request. I can still help with NovaMart orders, returns, shipping, or warranties.'
+        ),
+        blockedOutputsMessaging=(
+            'I’m sorry, but I can’t provide that response. I can help with another NovaMart support question.'
+        ),
+    )
+    guardrail_id = response['guardrailId']
+    guardrail_version = _create_numbered_version(guardrail_id)
+    print(f"Guardrail created: {guardrail_id} (version: {guardrail_version})")
+    return guardrail_id, guardrail_version
 
 
 def deploy_to_agentcore_runtime(
@@ -1035,24 +1101,27 @@ def deploy_to_agentcore_runtime(
     # Stage the code the CLI packages (src modules + config.py + pyproject.toml).
     agentcore_cli.stage_runtime_code()
 
-    # TODO: Configure and deploy the runtime with the AgentCore CLI
-    # 1. Build the runtime environment variables dict `runtime_env` with:
-    #      AWS_REGION, PROJECT_NAME (config.AWS_REGION / config.PROJECT_NAME),
-    #      RETURNS_KB_ID, SHIPPING_KB_ID, WARRANTY_KB_ID (from config),
-    #      AGENT_LOG_GROUP (config.AGENT_LOG_GROUP), and the guardrail
-    #      (GUARDRAIL_ID = guardrail_id, GUARDRAIL_VERSION = guardrail_version)
-    # 2. Write the runtime settings to agentcore/agentcore.json with
-    #      agentcore_cli.configure_runtime(env_vars=runtime_env,
-    #                                      network_mode='PUBLIC',
-    #                                      protocol='HTTP',
-    #                                      execution_role_arn=config.AGENTCORE_ROLE_ARN)
-    # 3. Deploy:  agentcore_cli.deploy()        (runs `agentcore deploy -y`)
-    # 4. Read the ARN the CLI recorded:
-    #      runtime_arn = agentcore_cli.deployed_runtime_arn()
-    runtime_arn = None
+    runtime_env = {
+        'AWS_REGION': config.AWS_REGION,
+        'PROJECT_NAME': config.PROJECT_NAME,
+        'RETURNS_KB_ID': config.RETURNS_KB_ID,
+        'SHIPPING_KB_ID': config.SHIPPING_KB_ID,
+        'WARRANTY_KB_ID': config.WARRANTY_KB_ID,
+        'AGENT_LOG_GROUP': config.AGENT_LOG_GROUP,
+        'GUARDRAIL_ID': guardrail_id,
+        'GUARDRAIL_VERSION': guardrail_version,
+    }
+    agentcore_cli.configure_runtime(
+        env_vars=runtime_env,
+        network_mode='PUBLIC',
+        protocol='HTTP',
+        execution_role_arn=config.AGENTCORE_ROLE_ARN,
+    )
+    agentcore_cli.deploy()
+    runtime_arn = agentcore_cli.deployed_runtime_arn()
 
     if not runtime_arn:
-        raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
+        raise RuntimeError('AgentCore CLI completed without recording a runtime ARN.')
 
     # Wait for the runtime to become READY and return its ARN.
     print(f"  Runtime deployed: {runtime_arn}")
@@ -1083,19 +1152,20 @@ def configure_memory(runtime_arn: str) -> str:
             print(f"AgentCore Memory already exists: {memory_arn}")
             return memory_arn
 
-    # TODO: Create AgentCore Memory
-    # Use agentcore_control.create_memory() with:
-    #   - name (memory_name) and a description
-    #   - eventExpiryDuration = 7   (days)
-    #   - memoryStrategies = [{'summaryMemoryStrategy': {
-    #         'name': 'SessionSummary',
-    #         'namespaces': ['/summaries/{actorId}/{sessionId}']}}]
-    #   - clientToken (e.g. str(uuid.uuid4())) for idempotency
-    # Store the API response in `response`.
-    response = None
-
-    if response is None:
-        raise NotImplementedError("configure_memory: create_memory() not implemented")
+    response = agentcore_control.create_memory(
+        name=memory_name,
+        description='Stores session-scoped NovaMart conversation summaries for customer support.',
+        eventExpiryDuration=7,
+        memoryStrategies=[
+            {
+                'summaryMemoryStrategy': {
+                    'name': 'SessionSummary',
+                    'namespaces': ['/summaries/{actorId}/{sessionId}'],
+                },
+            },
+        ],
+        clientToken=str(uuid.uuid4()),
+    )
 
     # Wait until the memory resource is ACTIVE and return its ARN.
     memory = response['memory']
@@ -1130,18 +1200,24 @@ def configure_observability(runtime_arn: str) -> None:
                           sampling percentage; runtime env AGENT_TRACING_ENABLED /
                           AGENT_TRACE_SAMPLING_RATE
     """
-    # TODO: Build the logging configuration
-    # logging_configuration = {
-    #     'cloudWatchConfig': {'logGroupName': config.AGENT_LOG_GROUP,
-    #                          'logLevel': 'INFO', 'enabled': True},
-    #     'xRayConfig':       {'enabled': True, 'samplingRate': 1.0},
-    # }
-    # Then apply it:  summary = apply_observability_config(runtime_arn, logging_configuration)
-    # Wrap the call in try/except - on success print the CloudWatch log group
-    # and the X-Ray sampling rate; on exception print
-    #   "[Note] Observability configuration failed: <e>"
-
-    pass
+    logging_configuration = {
+        'cloudWatchConfig': {
+            'logGroupName': config.AGENT_LOG_GROUP,
+            'logLevel': 'INFO',
+            'enabled': True,
+        },
+        'xRayConfig': {
+            'enabled': True,
+            'samplingRate': 1.0,
+        },
+    }
+    try:
+        summary = apply_observability_config(runtime_arn, logging_configuration)
+        log_group = summary.get('log_group', config.AGENT_LOG_GROUP)
+        print(f"  CloudWatch logging configured: {log_group}")
+        print(f"  X-Ray tracing configured: {logging_configuration['xRayConfig']['samplingRate']:.0%} sampling")
+    except Exception as exc:
+        print(f"[Note] Observability configuration failed: {exc}")
 
 
 # ═══════════════════════════════════════════════════════
